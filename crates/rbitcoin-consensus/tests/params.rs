@@ -219,6 +219,28 @@ fn regtest_pow_bits_overlay_is_regtest_only_and_bounded() {
     }
 }
 
+/// `--regtest-pow-bits` is bounded by the attainable target, so the order of
+/// `apply_regtest_pow_bits` and `apply_regtest_retarget` cannot bypass the
+/// floor check: on default regtest the bound is the pow limit, under
+/// `--retarget-regtest` it is the retarget floor.
+#[test]
+fn regtest_pow_bits_is_bounded_by_the_attainable_target() {
+    // Retarget first: an overlay easier than the floor is refused even though
+    // it is harder than the pow limit.
+    let mut p = ChainParams::regtest();
+    p.apply_regtest_retarget().unwrap();
+    assert!(p.apply_regtest_pow_bits(0x1f7f_ffff).is_err());
+    p.apply_regtest_pow_bits(0x1d7f_ffff).unwrap();
+    assert_eq!(
+        p.regtest_pow_bits_overlay.map(|b| b.to_consensus()),
+        Some(0x1d7f_ffff)
+    );
+    // Default regtest keeps the pow-limit bound.
+    let mut q = ChainParams::regtest();
+    assert!(q.apply_regtest_pow_bits(0x207f_ffff).is_err());
+    assert!(q.apply_regtest_pow_bits(0x1f7f_ffff).is_ok());
+}
+
 /// Core `CTestNet4Params`: genesis, buried heights at 1, BIP30 on at every
 /// height (null BIP34 hash), testdummy never active, and BIP94 enforced.
 #[test]

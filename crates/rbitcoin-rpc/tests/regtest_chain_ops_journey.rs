@@ -732,6 +732,46 @@ fn chain_ops_network_identity(ctx: &RpcContext) {
     );
 }
 
+/// `--rpc-compat-profile bark-v31` on regtest: the version floor a bark
+/// server enforces (310000) passes on the claimed version while the real
+/// rbitcoin identity stays in `subversion`, and the claimed Core package
+/// dialect is the one the node actually enforces for `submitpackage` - the
+/// same `IsChildWithParents` gate `RBITCOIN_RPC_PACKAGE_DIALECT=1` selects.
+#[test]
+fn chain_ops_compat_profile_bark_v31_claim_and_dialect() {
+    let (mut ctx, dir, _hub) = ctx_regtest_hub();
+    ctx.compat_profile = Some(RpcCompatProfile::BarkV31);
+    ctx.package_dialect = true;
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(net["version"].as_u64(), Some(310_000), "{net}");
+    assert_eq!(
+        net["subversion"].as_str().unwrap(),
+        rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
+            .unwrap()
+    );
+    assert_eq!(net["rbitcoin_compat"]["profile"], json!("bark-v31"));
+    assert_eq!(net["rbitcoin_compat"]["claimed_version"], json!(310_000));
+    assert_eq!(
+        net["rbitcoin_compat"]["package_dialect"],
+        json!("core-is-child-with-parents")
+    );
+
+    let txid = |n: u8| bitcoin::Txid::from_byte_array([n; 32]);
+    let p1 = spend_outpoints(&[(txid(1), 0)], 1_000);
+    let p2 = spend_outpoints(&[(txid(2), 0)], 1_000);
+    let pkg = json!([&p1, &p2]
+        .iter()
+        .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(*t)))
+        .collect::<Vec<_>>());
+    let err = dispatch(&ctx, "submitpackage", vec![pkg]).unwrap_err();
+    assert_eq!(err["code"], ERR_VERIFY_ERROR, "{err}");
+    assert_eq!(
+        rpc_message(&err),
+        "package topology disallowed. not child-with-parents or parents depend on each other."
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A second genesis hub. Tip age, the mining-info template latch, and the
 /// header-tip cap are visible here before this chain has assembled a template
 /// or left IBD. The long regtest journey has already done both.

@@ -24,6 +24,18 @@ pub struct Bip9Deployment {
     pub threshold: u32,
 }
 
+/// `--retarget-regtest` target spacing: one block per 10 seconds.
+const REGTEST_RETARGET_SPACING_SECS: u64 = 10;
+
+/// `--retarget-regtest` target timespan: 24 blocks (one adjustment interval).
+const REGTEST_RETARGET_TIMESPAN_SECS: u64 = 240;
+
+/// `--retarget-regtest` difficulty floor (`0x1e7fffff`): the easiest target a
+/// retarget may clamp to, and the default difficulty of the first period.
+/// About 2^17 header hashes per block at the floor, so a CPU miner keeps up.
+/// [`ChainParams::apply_regtest_retarget`] documents why the floor exists.
+const REGTEST_RETARGET_FLOOR_BITS: u32 = 0x1e7f_ffff;
+
 /// Static chain parameters for validation.
 #[derive(Debug, Clone)]
 pub struct ChainParams {
@@ -43,9 +55,12 @@ pub struct ChainParams {
     pub segwit_height_overlay: Option<u32>,
     /// Subsidy halving interval overlay (`None` = network default).
     pub subsidy_halving_overlay: Option<u32>,
-    /// Regtest fixed difficulty for every block at height >= 1 (`None` = the
-    /// network `pow_limit` bits). `header::apply_regtest_pow_overlay` applies
-    /// it on regtest only, from `next_work_bits` and the off-tip header check.
+    /// Regtest fixed difficulty (`None` = the network `pow_limit` bits, or
+    /// with `--retarget-regtest` the [`REGTEST_RETARGET_FLOOR_BITS`]
+    /// initialization). `header::apply_regtest_pow_overlay` applies it on
+    /// regtest only, from `next_work_bits` and the off-tip header check:
+    /// every block at height >= 1 without retargeting, or the first period
+    /// (heights below the adjustment interval) with retargeting on.
     pub regtest_pow_bits_overlay: Option<CompactTarget>,
     /// Header hash at BIP34 height that turns BIP30 off. `None` on signet and
     /// regtest (Core's null hash), so BIP30 stays on at every height.
@@ -380,7 +395,10 @@ impl ChainParams {
     /// Fix regtest difficulty at `bits` for every block at height >= 1.
     ///
     /// Refuses other networks, a zero, negative or overflowing target, and a
-    /// target not harder than `pow_limit` (a no-op). Not a Bitcoin Core option.
+    /// target not harder than the attainable target (the pow limit on default
+    /// regtest, the retarget floor after [`Self::apply_regtest_retarget`]),
+    /// so the order of the two calls cannot bypass the floor. Not a Bitcoin
+    /// Core option.
     pub fn apply_regtest_pow_bits(&mut self, bits: u32) -> Result<(), &'static str> {
         if self.network != Network::Regtest {
             return Err("regtest_pow_bits is regtest only");
@@ -403,8 +421,8 @@ impl ChainParams {
         if target == Target::ZERO {
             return Err("regtest_pow_bits target is zero");
         }
-        if target >= self.pow_limit {
-            return Err("regtest_pow_bits is not harder than the regtest pow limit");
+        if target >= self.btc.max_attainable_target {
+            return Err("regtest_pow_bits is not harder than the attainable target");
         }
         self.regtest_pow_bits_overlay = Some(bits);
         Ok(())
@@ -420,6 +438,45 @@ impl ChainParams {
             return Err("invalid compact bits (hex, up to 8 digits)");
         }
         u32::from_str_radix(hex, 16).map_err(|_| "invalid compact bits (hex, up to 8 digits)")
+    }
+
+    /// `--retarget-regtest` (conf `retarget_regtest`): retargeting on regtest
+    /// with a fixed lab schedule and difficulty floor. Not a Bitcoin Core
+    /// option; regtest only.
+    ///
+    /// The schedule is a 10-second target spacing and a 240-second target
+    /// timespan (a 24-block adjustment interval, so a boundary lands about
+    /// every four minutes at equilibrium), with no min-difficulty gaps and
+    /// BIP94 off. The floor [`REGTEST_RETARGET_FLOOR_BITS`] is the easiest
+    /// target a retarget may clamp to and the default difficulty of the first
+    /// period. The floor exists because the regtest `pow_limit` sits just
+    /// under 2^256: a boundary computed from it overflows the 256-bit
+    /// retarget multiply — debug builds assert, release builds wrap
+    /// (`docs/operator/operations.md` owns the mechanism) — while every
+    /// target the floor allows stays far below the overflow. `--regtest-pow-bits`
+    /// then overrides the first-period initialization, and must be at least
+    /// as hard as the floor for the same reason.
+    pub fn apply_regtest_retarget(&mut self) -> Result<(), &'static str> {
+        if self.network != Network::Regtest {
+            return Err("retarget_regtest is regtest only");
+        }
+        let floor =
+            Target::from_compact(CompactTarget::from_consensus(REGTEST_RETARGET_FLOOR_BITS));
+        if let Some(bits) = self.regtest_pow_bits_overlay {
+            if Target::from_compact(bits) > floor {
+                return Err("regtest_pow_bits is easier than the retarget floor");
+            }
+        }
+        self.btc.no_pow_retargeting = false;
+        self.btc.allow_min_difficulty_blocks = false;
+        self.btc.pow_target_spacing = REGTEST_RETARGET_SPACING_SECS;
+        self.btc.pow_target_timespan = REGTEST_RETARGET_TIMESPAN_SECS;
+        self.btc.max_attainable_target = floor;
+        if self.regtest_pow_bits_overlay.is_none() {
+            self.regtest_pow_bits_overlay =
+                Some(CompactTarget::from_consensus(REGTEST_RETARGET_FLOOR_BITS));
+        }
+        Ok(())
     }
 
     /// Parse one Core `name@height` token.

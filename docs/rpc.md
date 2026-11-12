@@ -42,6 +42,122 @@ The floor stops at 0.19. A higher integer would tell those clients that
 later Core RPC is present, including descriptor-wallet calls from 0.21
 (`210000`). It would not change what peers accept.
 
+### Opt-in named compat profile `bark-v31` (regtest only)
+
+`--rpc-compat-profile bark-v31` (conf `rpc_compat_profile=bark-v31`) is an
+opt-in, **named** RPC compatibility claim for version-gated lab clients
+(the ark/bark server at `c419159` requires `getnetworkinfo.version >=
+310000`). Valid only on regtest: any other network fails config validation
+before the datadir or store opens. There is no free-form version integer
+and no env form: `bark-v31` is the only accepted value, the CLI flag and
+the conf key are the only selectors (a `RBITCOIN_RPC_COMPAT_PROFILE`
+variable is not a knob and does nothing), and an explicitly-off
+`RBITCOIN_RPC_PACKAGE_DIALECT=0` together with the profile is a startup
+config error, never a silent resolution.
+
+While the profile is on:
+
+- `getnetworkinfo.version` reports **310000** as an explicit claim. Every
+  other `getnetworkinfo` field is unchanged; `subversion` keeps the real
+  `/rbitcoin:<semver>/` identity (plus any `--ua-comment`) and
+  `protocolversion` stays 70016.
+- `getnetworkinfo` appends a `rbitcoin_compat` object naming the claim:
+  `{"profile":"bark-v31","claimed_version":310000,"package_dialect":"core-is-child-with-parents"}`.
+- `submitpackage` uses Core `IsChildWithParents` — the same dialect
+  `RBITCOIN_RPC_PACKAGE_DIALECT=1` selects; the profile turns that existing
+  behavior on.
+- Startup logs
+  `rpc_compat_profile=bark-v31 claimed_version=310000 software=rbitcoin software_version=<real>`.
+
+The claim is deliberately narrow: read-only RPC surface shape for probed
+clients, not "is Bitcoin Core v31". Funded broadcast/mempool behavior stays
+unproven by read-only probes, and known surface mismatches stay mismatched
+(`getmempoolinfo.maxdatacarriersize` is null where the selected modelling
+consumer expects an integer). Default is **off**: `version` stays 190000
+and no `rbitcoin_compat` key appears.
+
+## Effective consensus identity and fingerprint (schema 1)
+
+`getblockchaininfo.consensus` additionally reports four fields from the same
+resolved `ChainHub.params` used for validation. A context without a hub uses
+`ChainParams::for_network`, as the existing consensus object already did.
+
+- `consensus_profile_id`: `rbitcoin-consensus/1/<network>/<variant>`. Networks
+  are `main`, `test`, `testnet4`, `signet`, `regtest`. Regtest variants are
+  `fixed` when `no_pow_retargeting` is true, otherwise `retarget`; other
+  networks use `chain`. This is a versioned profile schema/variant identity,
+  not a software version, RPC compatibility claim, or unique configuration.
+- `profile_fingerprint`: lowercase 64-hex SHA-256 of the typed encoding below.
+  Different effective consensus facts change it; RPC `bark-v31` does not.
+- `initial_target_bits`: eight lowercase hex digits. On regtest with an
+  effective overlay, this is that configured overlay, including the initial
+  floor installed by `apply_regtest_retarget`. Otherwise it is the network's
+  genesis header bits from the same `genesis_block(params)` constructor used
+  by the chain. It is neither current tip bits nor a promised future target.
+  Plain node regtest has no overlay and reports `207fffff`; the lab explicitly
+  passes `--regtest-pow-bits 200fffff`. This patch adds no CLI default.
+- `subsidy_initial_sats`: unsigned decimal string from the actual consensus
+  function `block_subsidy(0, params)`, checked into u64. The current function
+  fixes the initial subsidy at 5000000000 sats; no initial-amount config knob
+  exists. Its interval is resolved through `subsidy_halving_interval()`.
+  The RPC does not recompute the subsidy from a floating-point BTC value.
+
+### Fingerprint encoding
+
+Hash exactly the following concatenation once with SHA-256 (not double-SHA256
+or a tagged Bitcoin hash); print digest bytes in forward lowercase hex.
+The first bytes are ASCII `rbitcoin-consensus-facts/1` followed by one NUL.
+All integers are unsigned fixed-width **big-endian**. `bool` is one byte,
+0 or 1. `blob` is u32 byte length followed by the bytes. `optional blob` is
+one byte 0 for absent, or 1 followed by a blob for present (even if empty).
+Hashes are 32 bytes in internal/wire order, reversed relative to displayed
+Bitcoin block/transaction hashes. Targets are exact 32-byte big-endian
+integers, **not** their lossy compact/display-target rendering.
+
+The ordered fields after the prefix are:
+
+| Order | Type | Source in resolved `ChainParams` / profile |
+|---|---|---|
+| 1 | blob ASCII | `consensus_profile_id` (includes `cp.network`) |
+| 2 | blob ASCII | `cp.btc.network`, with the same network names |
+| 3 | bytes32 | `cp.genesis_hash` |
+| 4 | bytes32 | `cp.genesis_coinbase_txid` |
+| 5 | u32 | `initial_target_bits` |
+| 6 | optional blob of 4 bytes | `cp.regtest_pow_bits_overlay`, u32 bits |
+| 7 | bytes32 | exact `cp.pow_limit` |
+| 8 | bytes32 | exact `cp.btc.max_attainable_target` (retarget floor) |
+| 9 | u64 | `cp.btc.pow_target_spacing` |
+| 10 | u64 | `cp.btc.pow_target_timespan` |
+| 11 | u32 | `cp.difficulty_adjustment_interval()` |
+| 12-14 | bool each | `no_pow_retargeting()`, `allow_min_difficulty_blocks()`, `enforce_bip94` |
+| 15 | u64 | `subsidy_initial_sats` |
+| 16-17 | u32 each | `subsidy_halving_interval()`, `coinbase_maturity()` |
+| 18 | u32 | `cp.btc.bip16_time` |
+| 19-21 | u32 each | `cp.btc.bip34_height`, `bip66_height`, `bip65_height` |
+| 22-24 | u32 each | `csv_height()`, `segwit_height()`, `taproot_height()` |
+| 25-26 | u32 each | `cp.btc.rule_change_activation_threshold`, `miner_confirmation_window` |
+| 27 | optional blob of bytes32 | `cp.bip34_hash` |
+| 28 | optional blob | `cp.signet_challenge` raw script bytes |
+| 29 | option deployment | 0 if `testdummy` is absent; otherwise 1, bit u8, period u32, threshold u32 |
+
+Effective getters encode activation/subsidy overlays; redundant configuration
+spelling does not change a fact. The deprecated, unused `btc.pow_limit` alias
+is not an input. The subsidy rule (right shift by height/interval, zero at 64
+halvings), fixed consensus rules and encoding belong to schema 1; changing
+those rules or input definitions requires a new schema version. This is not
+a binary-attestation hash: callers must also bind the node binary and complete
+launch policy. Policy outside ChainParams (RPC dialect, mempool policy,
+milestone/trust settings), ports, paths, credentials, clock and chain tip are
+not part of this consensus-parameter fingerprint. No environment is read.
+
+Independent cross-language vector:
+[`consensus-fingerprint-v1.json`](../crates/rbitcoin-rpc/tests/fixtures/consensus-fingerprint-v1.json)
+contains typed inputs, all 304 preimage bytes and digest
+`4634ab3e2ca66aa9d319b35d89131f7ad1fc48c3b315435652282fe9e20b79d3`
+for regtest with explicit overlay `200fffff`. Reproduce with
+`python3 scripts/check-consensus-fingerprint.py`. The RPC suite matches that
+digest through `getblockchaininfo`, not by calling a test-only hash path.
+
 ## Operator knobs
 
 | Knob | Default | Meaning |
@@ -55,6 +171,7 @@ later Core RPC is present, including descriptor-wallet calls from 0.21
 | `--sh-index` | **off** | Class B scripthash for Electrum/Esplora address history. RPC by height/hash/txid does not need it |
 | `--block-filter-index` | **off** | BIP158 basic. IBD seals them when the flag is on from the start. A later enable still materializes after catch-up. `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip (`getnetworkinfo` lists `COMPACT_FILTERS`), then for the life of the process. `getblockfilter` serves a sealed height, one block whose parent filter is already sealed, and a stale branch back to that sealed fork point. An unsealed best-chain gap is refused. `/rest/blockfilter/` and P2P still serve only heights the watermark covers. Independent of `--sh-index` |
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. The call holds that slot while it waits for a `--store-read-budget` permit. A call that does not read the store, including `getblockcount`, does not take that permit. `waitforblock`, `waitforblockheight`, `waitfornewblock`, and a `getblocktemplate` long-poll (a non-null `longpollid` in template mode; proposal mode does not wait) do not hold the work-queue slot or the disk permit while they wait. A `getblocktemplate` with no `longpollid` keeps the slot and takes it before any store read. The template build reads the tip with no disk permit, takes one permit, and reads the tip again without waiting on connect. It keeps that permit for the header reads only when both reads match, then drops it before transaction selection, so a block connect does not pin that permit and a store read can run during selection. After a long-poll, the next call in that POST waits for a work-queue slot. A POST that has not run a call is still HTTP 503, including a long-poll, and that 503 is before the tip poll. `--store-read-budget N` (`store_read_budget=`) overrides `--datadir-hdd`. Omitted or `0` is 1 on `--datadir-hdd`, otherwise one less than the core count, minimum 1 |
+| `--rpc-compat-profile bark-v31` / conf `rpc_compat_profile=` | **off** | Regtest-only named RPC compat claim: `getnetworkinfo.version` reports 310000 with an `rbitcoin_compat` object while `subversion` keeps the real identity, and `submitpackage` uses Core `IsChildWithParents`. Only value `bark-v31`; no env form; `RBITCOIN_RPC_PACKAGE_DIALECT=0` with it refuses startup. See [Opt-in named compat profile](#opt-in-named-compat-profile-bark-v31-regtest-only) |
 | `--rest` / conf `rest=` | **off** | Unauthenticated `/rest/` on the RPC listener. Own queue, same depth as `--rpc-work-queue`'s default. The body is read before that permit is taken. Without the flag those paths are 404. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
@@ -136,7 +253,7 @@ still wait for durable SH when shindex is on.
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
 | `echo` / `echojson` | Testing RPC. `echojson` is the same method. Returns arguments as a positional array. AuthServiceProxy `{args: [...], argN: ...}` is peeled only here. Mixed `submitpackage`/`sendrawtransaction`/`testmempoolaccept` `{args, maxfeerate}` is expanded in the Core-functional proxy, not on the node. |
-| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `getblockcount` / `getbestblockhash` wait for the in-flight tip-accept job (not the rest of a catch-up burst). `headers` is the best known local header height, including IBD's accepted header walk during fresh sync and resume, plus `submitheader` / P2P header tips. It may lead `blocks`; peer-advertised heights alone do not count. `chainwork` is summed header work (regtest 2 per block). `bits` and `target` are the tip compact target. `difficulty` prints with 16 significant digits. `size_on_disk` is a walk of `{datadir}/store` file lengths (plus `--datadir-cold` when split), reused for 30 seconds. A file added or grown in that window stays invisible until the next walk. `verificationprogress` is `blocks / headers` clamped to `[0, 1]` (`1.0` when `headers` is 0). `initialblockdownload` is the Core RPC name for **relay-inhibited**: `--min-chain-work` and `--max-tip-age` after densify/`enter_tip_mode`, not “still catching up”. `--prune-seqsigwit` sets `pruned: true` and `pruneheight` (omitted when off). |
+| `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `getblockcount` / `getbestblockhash` wait for the in-flight tip-accept job (not the rest of a catch-up burst). `headers` is the best known local header height, including IBD's accepted header walk during fresh sync and resume, plus `submitheader` / P2P header tips. It may lead `blocks`; peer-advertised heights alone do not count. `chainwork` is summed header work (default regtest 2 per block; under `--retarget-regtest` it follows the retargeted target, ~2^17 at the floor). `bits` and `target` are the tip compact target. `difficulty` prints with 16 significant digits. `size_on_disk` is a walk of `{datadir}/store` file lengths (plus `--datadir-cold` when split), reused for 30 seconds. A file added or grown in that window stays invisible until the next walk. `verificationprogress` is `blocks / headers` clamped to `[0, 1]` (`1.0` when `headers` is 0). `initialblockdownload` is the Core RPC name for **relay-inhibited**: `--min-chain-work` and `--max-tip-age` after densify/`enter_tip_mode`, not “still catching up”. `--prune-seqsigwit` sets `pruned: true` and `pruneheight` (omitted when off). `consensus` is the effective profile behind the node (not a Bitcoin Core field): `network`, `genesis_hash`, `pow_limit_bits` / `pow_limit_target` (the validation limit), `retarget_floor_bits` / `retarget_floor_target` (the easiest target a retarget may clamp to; the `--retarget-regtest` floor), `pow_target_spacing`, `pow_target_timespan`, `difficulty_adjustment_interval`, `no_pow_retargeting`, `allow_min_difficulty_blocks`, `enforce_bip94`, `regtest_pow_bits_overlay` (hex or `null`), `subsidy_halving_interval`, `coinbase_maturity`, and `activation_heights` (`bip34`, `bip66`, `bip65`, `csv`, `segwit`, `taproot`), so a harness can fingerprint the chain it is talking to |
 | `getblockheader` / `getblock` (verbosity 0/1/2/3) | Archive reconstruct. `getblockheader` includes `chainwork`, `target`, and `nextblockhash` when the next active block exists. Genesis omits `previousblockhash`. A header that is stored but not on the active chain (reorg or `invalidateblock`) returns `confirmations: -1` and its own `previousblockhash`. `getblock` returns a Class A body for that hash the same way, or a held never-confirmed body. Verbosity 0/2 below `pruneheight` is `-8` `Block not available (pruned data)`; verbosity 1 (txids) stays. Every `getblock` verbosity >= 1 carries Core's `coinbase_tx` (`version`, `locktime`, `sequence`, `coinbase`, and `witness` when the coinbase has one). Below `pruneheight` verbosity 1 still answers (Core cannot) but omits `coinbase_tx`, because pruning drops the sequence, scriptSig, and witness it is made of. Verbosity >= 2 adds a BTC `fee` to each non-coinbase, and verbosity >= 3 adds `vin[].prevout` (the `getrawtransaction` verbosity 2 object). Both come from the stored body's prevout edges, Core's undo data, so a block disconnected by a reorg or `invalidateblock` keeps them. A parent created in that block or an earlier block of its stale branch takes its height from the branch, walked at most 10,000 blocks down to the active chain. A deeper branch is not placed: `getblock` verbosity >= 1 fails with `-1` `side header walk exceeded` before it reads undo, and `getrawtransaction` verbosity 2 with that `blockhash` fails with the `-32603` undo error. A held never-connected body has none, as Core. Stored edges or outputs that do not read fail the call with Core's `-32603` `Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event.`, as does `getrawtransaction` verbosity 2. `confirmations`, `nextblockhash`, and the active check come from one sample of the tip, `confirmed[height]`, and the slot above it, read after the body. The block is reported active only if that sample still holds it and the next block is its child; otherwise the answer is the disconnected-block object. A failed read of the tip or that slot is `-32603`, not a disconnected block. `previousblockhash` is the header's own parent. |
 | `getblockstats` | All networks. Stamped `txstat` fee/size/weight/`n_in`. Size and count fields match Core: coinbase is left out of `ins`, fees, `total_size`, `total_weight`, and the segwit totals. `utxo_increase` is every output minus those inputs. `utxo_increase_actual` drops outputs that do not enter the UTXO set (height 0, the two mainnet BIP30-repeat coinbases, unspendable scripts). `utxo_size_inc` is each output's serialized size plus Core v32.1's 40-byte `PER_UTXO_OVERHEAD` (outpoint, packed height and coinbase flag), minus the same for each spent prevout; `utxo_size_inc_actual` adds only the outputs that enter the UTXO set. A stamped block reads every spent parent output for these two; a `stats` list that names neither skips those reads. Unstamped leftover reconstructs then lazy-stamps. Reconstruct miss is `block body not in store`. Dummy `blk00000.dat` is shim-only so `rpc_getblockstats.py`'s rename-file needle stays Core-phrased. Pruned unstamped height is `-8` Core pruned text. |
 | `getdifficulty` | From tip bits, 16 significant digits |

@@ -80,6 +80,7 @@ fn operator_conf_and_argv() {
         "--startup-notify",
         "--test-activation-height",
         "--regtest-pow-bits",
+        "--retarget-regtest",
         "--rpc-work-queue",
         "--peer-timeout",
         "--blocks-only",
@@ -796,16 +797,17 @@ fn block_queue_env_sets_the_assign_stop() {
     assert_eq!(stop(&[(GB, "")]), BQ_ASSIGN_STOP_BYTES);
 }
 
-/// `RBITCOIN_TEST_DROP_STORE`, `RBITCOIN_SH_FORCE_REBUILD`,
-/// `RBITCOIN_RPC_PACKAGE_DIALECT`, and `RBITCOIN_RPC_WAIT_TIP_IDLE` are on for
-/// `1` or `true` and off for `0`, `false`, or empty (`true`/`false` in any
-/// case). All but the first reach `NodeConfig`.
+/// `RBITCOIN_TEST_DROP_STORE`, `RBITCOIN_SH_FORCE_REBUILD`, and
+/// `RBITCOIN_RPC_WAIT_TIP_IDLE` are on for `1` or `true` and off for `0`,
+/// `false`, or empty (`true`/`false` in any case). `RBITCOIN_RPC_PACKAGE_DIALECT`
+/// is tri-state (`None` unset, `Some(false)` explicitly off) because the
+/// compat profile must tell an explicitly-off dialect from an unset one.
+/// All but the first reach `NodeConfig`.
 #[test]
 fn env_flags_take_one_true_zero_or_false() {
-    const KEYS: [&str; 4] = [
+    const KEYS: [&str; 3] = [
         "RBITCOIN_TEST_DROP_STORE",
         "RBITCOIN_SH_FORCE_REBUILD",
-        "RBITCOIN_RPC_PACKAGE_DIALECT",
         "RBITCOIN_RPC_WAIT_TIP_IDLE",
     ];
     let flags = |key: &str, val: &str| {
@@ -813,22 +815,46 @@ fn env_flags_take_one_true_zero_or_false() {
         [
             env.test_drop_store,
             env.sh_force_rebuild,
-            env.rpc_package_dialect,
             env.rpc_wait_tip_idle,
         ]
     };
     for on in ["1", "true", "TRUE", "True"] {
         for (i, key) in KEYS.iter().enumerate() {
-            let mut want = [false; 4];
+            let mut want = [false; 3];
             want[i] = true;
             assert_eq!(flags(key, on), want, "{key}={on:?}");
         }
     }
     for off in ["", "0", "false", "FALSE"] {
         for key in KEYS {
-            assert_eq!(flags(key, off), [false; 4], "{key}={off:?}");
+            assert_eq!(flags(key, off), [false; 3], "{key}={off:?}");
         }
     }
+    for on in ["1", "true", "TRUE"] {
+        assert_eq!(
+            env_of(&[("RBITCOIN_RPC_PACKAGE_DIALECT", on)])
+                .unwrap()
+                .rpc_package_dialect,
+            Some(true),
+            "RBITCOIN_RPC_PACKAGE_DIALECT={on:?}"
+        );
+    }
+    for off in ["0", "false", "FALSE"] {
+        assert_eq!(
+            env_of(&[("RBITCOIN_RPC_PACKAGE_DIALECT", off)])
+                .unwrap()
+                .rpc_package_dialect,
+            Some(false),
+            "RBITCOIN_RPC_PACKAGE_DIALECT={off:?}"
+        );
+    }
+    assert_eq!(
+        env_of(&[("RBITCOIN_RPC_PACKAGE_DIALECT", "")])
+            .unwrap()
+            .rpc_package_dialect,
+        None,
+        "an empty value is unset"
+    );
     assert_eq!(env_of(&[]).unwrap(), NodeEnv::default());
 
     let env = env_of(&[
@@ -842,6 +868,145 @@ fn env_flags_take_one_true_zero_or_false() {
             assert!(config.sh_force_rebuild);
             assert!(config.rpc.package_dialect);
             assert!(config.rpc.wait_tip_idle);
+        }
+        other => panic!("expected assembled config, got {other:?}"),
+    }
+}
+
+/// `--rpc-compat-profile` accepts exactly `bark-v31`, defaults off, turns
+/// on the Core package dialect, and is regtest-only. CLI and conf are the
+/// only selectors: there is deliberately no `RBITCOIN_RPC_COMPAT_PROFILE`
+/// env knob (a new `RBITCOIN_*` surface needs the node repo's ask-first
+/// approval; the plan's env form stays proposed and unimplemented). An
+/// explicitly-off package dialect contradicts the profile's Core dialect
+/// claim and fails before the node starts, not silently.
+#[test]
+fn rpc_compat_profile_is_bark_v31_regtest_cli_only() {
+    use rbitcoin_rpc::methods::RpcCompatProfile;
+    let ready = |args: &[&str], env: &NodeEnv| operator_config_from_args(args, env);
+
+    match ready(
+        &["rbitcoin-node", "--network", "regtest"],
+        &NodeEnv::default(),
+    ) {
+        Ok(OperatorArgs::Ready { config, .. }) => {
+            assert_eq!(config.rpc.compat_profile, None);
+            assert!(!config.rpc.package_dialect);
+        }
+        other => panic!("default off: expected assembled config, got {other:?}"),
+    }
+    for args in [
+        vec![
+            "rbitcoin-node",
+            "--network",
+            "regtest",
+            "--rpc-compat-profile",
+            "bark-v31",
+        ],
+        vec![
+            "rbitcoin-node",
+            "--network",
+            "regtest",
+            "--rpc-compat-profile=bark-v31",
+        ],
+    ] {
+        match ready(&args, &NodeEnv::default()) {
+            Ok(OperatorArgs::Ready { config, .. }) => {
+                assert_eq!(config.rpc.compat_profile, Some(RpcCompatProfile::BarkV31));
+                assert!(config.rpc.package_dialect);
+            }
+            other => panic!(
+                "{}: expected assembled config, got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+    for bad in ["core-v31", "bark-v32", "310000", ""] {
+        let got = ready(
+            &[
+                "rbitcoin-node",
+                "--network",
+                "regtest",
+                "--rpc-compat-profile",
+                bad,
+            ],
+            &NodeEnv::default(),
+        );
+        assert_exit(got.unwrap_err(), ExitCode::from(2));
+    }
+    match ready(
+        &[
+            "rbitcoin-node",
+            "--network",
+            "signet",
+            "--rpc-compat-profile",
+            "bark-v31",
+        ],
+        &NodeEnv::default(),
+    ) {
+        Ok(OperatorArgs::Ready { config, .. }) => {
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("regtest"), "regtest-only: {err}");
+        }
+        other => panic!("expected assembled config, got {other:?}"),
+    }
+    // The conf key `rpc_compat_profile=bark-v31` is the same reviewed
+    // selector as the CLI flag.
+    {
+        let dir = tmp_datadir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("profile.conf");
+        std::fs::write(&conf, "regtest\nrpc_compat_profile=bark-v31\n").unwrap();
+        let cfg = ready_config(["rbitcoin-node", "--conf", conf.to_str().unwrap()]);
+        assert_eq!(cfg.rpc.compat_profile, Some(RpcCompatProfile::BarkV31));
+        assert!(cfg.rpc.package_dialect);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // CLI profile + explicitly-off dialect env fails closed at startup.
+    let env = env_of(&[("RBITCOIN_RPC_PACKAGE_DIALECT", "0")]).unwrap();
+    let got = ready(
+        &[
+            "rbitcoin-node",
+            "--network",
+            "regtest",
+            "--rpc-compat-profile",
+            "bark-v31",
+        ],
+        &env,
+    );
+    assert_exit(got.unwrap_err(), ExitCode::from(2));
+
+    let mut config = NodeConfig::default();
+    config.network = Network::Regtest;
+    config.rpc.compat_profile = Some(RpcCompatProfile::BarkV31);
+    let err = config
+        .resolve_rpc_env(&env_of(&[("RBITCOIN_RPC_PACKAGE_DIALECT", "0")]).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("RBITCOIN_RPC_PACKAGE_DIALECT") && err.contains("bark-v31"),
+        "conflict message names the knob and the profile: {err}"
+    );
+}
+
+/// `RBITCOIN_RPC_COMPAT_PROFILE` is not a knob: the profile is CLI/conf
+/// only, and an unrecognized `RBITCOIN_*` name is ignored, so the env var
+/// can neither activate nor mis-configure the claim.
+#[test]
+fn rpc_compat_profile_env_is_not_a_knob() {
+    let env = env_of(&[("RBITCOIN_RPC_COMPAT_PROFILE", "bark-v31")]).unwrap();
+    match operator_config_from_args(["rbitcoin-node", "--network", "regtest"], &env) {
+        Ok(OperatorArgs::Ready { config, .. }) => {
+            assert_eq!(config.rpc.compat_profile, None, "env must not activate");
+            assert!(!config.rpc.package_dialect);
+        }
+        other => panic!("expected assembled config, got {other:?}"),
+    }
+    // Even a would-be-unknown value stays inert (no new parse surface).
+    let env = env_of(&[("RBITCOIN_RPC_COMPAT_PROFILE", "bark-v32")]).unwrap();
+    match operator_config_from_args(["rbitcoin-node", "--network", "regtest"], &env) {
+        Ok(OperatorArgs::Ready { config, .. }) => {
+            assert_eq!(config.rpc.compat_profile, None);
         }
         other => panic!("expected assembled config, got {other:?}"),
     }
@@ -1151,6 +1316,74 @@ fn regtest_pow_bits_from_argv_and_conf() {
     )
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn retarget_regtest_from_argv_and_conf() {
+    let plain = ready_config(["rbitcoin-node", "--network=regtest"]);
+    assert!(plain.chain_params().unwrap().no_pow_retargeting());
+
+    let cfg = ready_config(["rbitcoin-node", "--network=regtest", "--retarget-regtest"]);
+    let p = cfg.chain_params().unwrap();
+    assert!(!p.no_pow_retargeting());
+    assert!(!p.allow_min_difficulty_blocks());
+    assert_eq!(p.btc.pow_target_spacing, 10);
+    assert_eq!(p.btc.pow_target_timespan, 240);
+    assert_eq!(p.difficulty_adjustment_interval(), 24);
+    // The floor seeds the first period when no overlay is given.
+    let floor = p
+        .btc
+        .max_attainable_target
+        .to_compact_lossy()
+        .to_consensus();
+    assert_eq!(floor, 0x1e7f_ffff);
+    assert_eq!(
+        p.regtest_pow_bits_overlay.map(|b| b.to_consensus()),
+        Some(floor)
+    );
+
+    let dir = tmp_datadir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("retarget.conf");
+    std::fs::write(&conf, "regtest\nretarget_regtest=1\n").unwrap();
+    let cfg = ready_config(["rbitcoin-node", "--conf", conf.to_str().unwrap()]);
+    assert!(!cfg.chain_params().unwrap().no_pow_retargeting());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Off regtest.
+    let off = ready_config(["rbitcoin-node", "--network=signet", "--retarget-regtest"]);
+    let err = off.chain_params().unwrap_err().to_string();
+    assert!(err.contains("regtest only"), "{err}");
+
+    // The overlay composes: it initializes the first period, and must be at
+    // least as hard as the floor (the floor keeps the retarget multiply
+    // under 2^256; the pow limit does not).
+    let both = ready_config([
+        "rbitcoin-node",
+        "--network=regtest",
+        "--retarget-regtest",
+        "--regtest-pow-bits=0x1d7fffff",
+    ]);
+    let p = both.chain_params().unwrap();
+    assert_eq!(
+        p.btc
+            .max_attainable_target
+            .to_compact_lossy()
+            .to_consensus(),
+        floor
+    );
+    assert_eq!(
+        p.regtest_pow_bits_overlay.map(|b| b.to_consensus()),
+        Some(0x1d7f_ffff)
+    );
+    let easy = ready_config([
+        "rbitcoin-node",
+        "--network=regtest",
+        "--retarget-regtest",
+        "--regtest-pow-bits=0x1f7fffff",
+    ]);
+    let err = easy.chain_params().unwrap_err().to_string();
+    assert!(err.contains("easier than the retarget floor"), "{err}");
 }
 
 #[test]

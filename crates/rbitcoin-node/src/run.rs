@@ -222,6 +222,7 @@ pub async fn start_rpc_listener(
         alert_notify: config.alert_notify.clone(),
         blocksonly: config.mempool.blocksonly,
         package_dialect: config.rpc.package_dialect,
+        compat_profile: config.rpc.compat_profile,
     };
     let op_true_signet = config.network == Network::Signet
         && config
@@ -254,6 +255,14 @@ pub async fn start_rpc_listener(
         h.socket_path,
         h.token_path.display()
     );
+    if let Some(profile) = config.rpc.compat_profile {
+        info!(
+            "rpc_compat_profile={} claimed_version={} software=rbitcoin software_version={}",
+            profile.name(),
+            profile.claimed_version(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     if let Some(addr) = h.local_addr {
         publish_listener_addr(config.datadir.path(), "rpc", addr);
     }
@@ -2534,6 +2543,7 @@ pub async fn start_esplora_if_ready(
                 alert_fired: Arc::new(AtomicBool::new(false)),
                 blocksonly,
                 package_dialect: false,
+                compat_profile: None,
             };
             gbt_template(&ctx).map_err(|v| {
                 v.get("message")

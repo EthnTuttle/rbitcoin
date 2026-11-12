@@ -280,6 +280,10 @@ pub struct RpcOpts {
     /// `submitpackage` uses Core `IsChildWithParents`. Set only from
     /// [`NodeEnv::rpc_package_dialect`].
     pub package_dialect: bool,
+    /// `--rpc-compat-profile` (conf key `rpc_compat_profile`). See
+    /// [`NodeConfig::resolve_rpc_env`] for the one policy path that fills
+    /// this and `package_dialect` together.
+    pub compat_profile: Option<rbitcoin_rpc::methods::RpcCompatProfile>,
     /// RPC tip waits drain the tip-accept lane. Set only from
     /// [`NodeEnv::rpc_wait_tip_idle`].
     pub wait_tip_idle: bool,
@@ -298,6 +302,7 @@ impl Default for RpcOpts {
             work_queue: Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE),
             rest: false,
             package_dialect: false,
+            compat_profile: None,
             wait_tip_idle: false,
         }
     }
@@ -322,8 +327,9 @@ pub struct NodeEnv {
     /// recollects all of Class A, on every start while it stays set.
     pub sh_force_rebuild: bool,
     /// `RBITCOIN_RPC_PACKAGE_DIALECT` is on: `submitpackage` uses Core
-    /// `IsChildWithParents`.
-    pub rpc_package_dialect: bool,
+    /// `IsChildWithParents`. `Some(false)` is an explicit off, which a
+    /// `--rpc-compat-profile` that selects a dialect conflicts with.
+    pub rpc_package_dialect: Option<bool>,
     /// `RBITCOIN_RPC_WAIT_TIP_IDLE` is on: `getblockcount`, `getbestblockhash`,
     /// and `wait_height` wait until the tip-accept lane is empty.
     pub rpc_wait_tip_idle: bool,
@@ -349,7 +355,7 @@ impl NodeEnv {
                 .map(|n| if n == 0 { u64::MAX } else { n }),
             test_drop_store: env_flag(var("RBITCOIN_TEST_DROP_STORE"))?,
             sh_force_rebuild: env_flag(var("RBITCOIN_SH_FORCE_REBUILD"))?,
-            rpc_package_dialect: env_flag(var("RBITCOIN_RPC_PACKAGE_DIALECT"))?,
+            rpc_package_dialect: env_flag_opt(var("RBITCOIN_RPC_PACKAGE_DIALECT"))?,
             rpc_wait_tip_idle: env_flag(var("RBITCOIN_RPC_WAIT_TIP_IDLE"))?,
         })
     }
@@ -375,10 +381,16 @@ where
 }
 
 fn env_flag((key, val): (&str, Option<OsString>)) -> Result<bool, NodeError> {
+    Ok(env_flag_opt((key, val))?.unwrap_or(false))
+}
+
+/// Like [`env_flag`] but keeps an explicit off distinct from unset, so a
+/// conflicting explicit setting can fail closed instead of being lost.
+fn env_flag_opt((key, val): (&str, Option<OsString>)) -> Result<Option<bool>, NodeError> {
     match env_value(key, val.as_deref())? {
-        None => Ok(false),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(true),
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Ok(false),
+        None => Ok(None),
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Ok(Some(false)),
         Some(v) => Err(NodeError::Config(format!(
             "{key}={v:?}: expected 1, true, 0, or false"
         ))),
@@ -494,8 +506,12 @@ pub struct NodeConfig {
     pub uacomments: Vec<String>,
     /// `--test-activation-height=name@height` (regtest).
     pub test_activation_heights: Vec<(String, u32)>,
-    /// `--regtest-pow-bits` compact bits fixed for every regtest block >= 1.
+    /// `--regtest-pow-bits` compact bits fixed for every regtest block >= 1,
+    /// or (with `--retarget-regtest`) the first-period initialization.
     pub regtest_pow_bits: Option<u32>,
+    /// `--retarget-regtest`: retargeting on regtest with the fixed lab
+    /// schedule and difficulty floor (`ChainParams::apply_regtest_retarget`).
+    pub retarget_regtest: bool,
     /// Do not evict/ban inbound (`--trusted`; Core functional `-whitelist=noban`).
     pub trusted: bool,
     /// Always announce inbound txs (`--always-relay`; Core `forcerelay`).
@@ -614,6 +630,7 @@ impl Default for NodeConfig {
             uacomments: Vec::new(),
             test_activation_heights: Vec::new(),
             regtest_pow_bits: None,
+            retarget_regtest: false,
             trusted: false,
             always_relay: false,
             relay: false,
@@ -779,6 +796,11 @@ impl NodeConfig {
                 .apply_regtest_pow_bits(bits)
                 .map_err(|e| NodeError::Config(format!("regtest_pow_bits: {e}")))?;
         }
+        if self.retarget_regtest {
+            params
+                .apply_regtest_retarget()
+                .map_err(|e| NodeError::Config(format!("retarget_regtest: {e}")))?;
+        }
         Ok(params)
     }
 
@@ -840,6 +862,14 @@ impl NodeConfig {
             return Err(NodeError::Config(
                 "--rest needs --rpc or --rpc-listen".into(),
             ));
+        }
+        if let Some(profile) = self.rpc.compat_profile {
+            if self.network != Network::Regtest {
+                return Err(NodeError::Config(format!(
+                    "--rpc-compat-profile {} requires network=regtest",
+                    profile.name()
+                )));
+            }
         }
         if self.sv2_tp_listen.is_some() && self.sv2_tp_authority_sec.is_none() {
             return Err(NodeError::Config(
@@ -1162,6 +1192,40 @@ impl NodeConfig {
         if let Some(n) = env.p2p_max_inbound {
             self.listen.max_inbound = n;
         }
+    }
+
+    /// The one policy path that resolves the RPC compat profile and the
+    /// package dialect into [`RpcOpts`]. Called once from
+    /// [`crate::finish_operator_config`] after CLI/conf/env are all in, so a
+    /// conflict fails closed at startup instead of silently resolving later.
+    ///
+    /// - The profile is CLI/conf only (`--rpc-compat-profile` /
+    ///   `rpc_compat_profile=`); there is deliberately no
+    ///   `RBITCOIN_RPC_COMPAT_PROFILE` env knob (a new `RBITCOIN_*` surface
+    ///   needs the node repo's ask-first approval).
+    /// - A profile selects its own package dialect (its whole point), so
+    ///   `RBITCOIN_RPC_PACKAGE_DIALECT=0` (explicit off) plus a profile is a
+    ///   config error.
+    /// - An unset or on dialect env just ORs in, preserving the existing
+    ///   behavior for the dialect alone.
+    /// - CLI and conf parse the same small set of profile names, so both
+    ///   parse or both fail; they cannot disagree on *which* profile. A
+    ///   second profile would need an explicit conflict rule here.
+    pub fn resolve_rpc_env(&mut self, env: &NodeEnv) -> Result<(), NodeError> {
+        if let Some(profile) = self.rpc.compat_profile {
+            if env.rpc_package_dialect == Some(false) {
+                return Err(NodeError::Config(format!(
+                    "rpc-compat-profile {} selects package dialect {}, but \
+                     RBITCOIN_RPC_PACKAGE_DIALECT is explicitly off",
+                    profile.name(),
+                    profile.package_dialect()
+                )));
+            }
+            self.rpc.package_dialect = true;
+        } else if env.rpc_package_dialect == Some(true) {
+            self.rpc.package_dialect = true;
+        }
+        Ok(())
     }
 
     /// Load a simple `key=value` conf (`#` comments). Hyphens and underscores match.
@@ -1621,6 +1685,12 @@ impl NodeConfig {
                 self.rpc.cookie_perms =
                     rbitcoin_rpc::RpcCookiePerms::parse(val).map_err(NodeError::Config)?;
             }
+            "rpc_compat_profile" => {
+                self.rpc.compat_profile = Some(
+                    rbitcoin_rpc::methods::RpcCompatProfile::parse(val)
+                        .map_err(|e| NodeError::Config(format!("conf rpc_compat_profile: {e}")))?,
+                );
+            }
             "ua_comment" => self.uacomments.push(val.to_string()),
             "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
@@ -1633,6 +1703,10 @@ impl NodeConfig {
                     ChainParams::parse_regtest_pow_bits(val)
                         .map_err(|e| NodeError::Config(format!("conf regtest_pow_bits: {e}")))?,
                 );
+            }
+            "retarget_regtest" => {
+                self.retarget_regtest = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf retarget_regtest: {e}")))?;
             }
             "persist_mempool" => {
                 self.mempool.persist = parse_conf_bool(val)

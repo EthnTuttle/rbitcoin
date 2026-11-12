@@ -13,6 +13,7 @@ use std::time::Instant;
 
 pub use chain::difficulty_rpc_f64;
 pub use chain::{tip_hash_height, wait_timeout_ms};
+pub use net::RpcCompatProfile;
 
 /// Cap for `waitfor*` and `getblocktemplate` long-poll. Not a knob.
 pub const RPC_WAIT_TIMEOUT_MS: u64 = 120_000;
@@ -304,6 +305,10 @@ pub struct RpcContext {
     /// `submitpackage` uses Core `IsChildWithParents` (the node's
     /// `RBITCOIN_RPC_PACKAGE_DIALECT`). Off by default.
     pub package_dialect: bool,
+    /// RPC compat profile (`--rpc-compat-profile bark-v31`). When set,
+    /// `getnetworkinfo` reports the profile's claimed version instead of
+    /// [`RPC_COMPAT_VERSION`] and appends an `rbitcoin_compat` object.
+    pub compat_profile: Option<RpcCompatProfile>,
     /// In-flight RPC methods for `getrpcinfo.active_commands`.
     pub active: Arc<std::sync::Mutex<RpcActive>>,
 }
@@ -1054,9 +1059,11 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
         "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
          initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
          max-tip-age), not still catching up. chainwork is summed header work\n\
-         (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
+         (default regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
          the cold store when split). verificationprogress is blocks/headers (1.0 when\n\
-         headers is 0).",
+         headers is 0). consensus is the effective profile (schedule, floors,\n\
+         retarget flags, regtest_pow_bits_overlay, activation heights) so a\n\
+         harness can fingerprint the chain; not a Bitcoin Core field.",
     ),
     (
         "getblockstats",

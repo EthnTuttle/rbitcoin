@@ -63,6 +63,7 @@ into `AGENTS.md`.
 | [`wallets.md`](./wallets.md) | Which on-chain wallets connect, and the server string or RPC cookie for each. Lightning stays in `lightning.md`. |
 | [`esplora-openapi.yaml`](./esplora-openapi.yaml) | OpenAPI 3.1 shapes for the Esplora REST surface, including `?asof=`. Behavior stays owned by COMPAT.md. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
+| [`reviews/`](./reviews/) | Dated implementation records for reviewed recommendations (design corrections, contracts, test evidence). Do not flatten into CHANGELOG. |
 
 ## Root (stay at root)
 

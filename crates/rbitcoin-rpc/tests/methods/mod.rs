@@ -57,6 +57,7 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         blocksonly: false,
         package_dialect: false,
+        compat_profile: None,
     }
 }
 
@@ -790,6 +791,41 @@ fn mempoolinfo_loaded_and_uacomment() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--rpc-compat-profile bark-v31` is an explicit RPC compatibility claim:
+/// `getnetworkinfo.version` reports the claimed 310000 (the bark server
+/// floor) instead of the node's own 190000, `subversion` keeps the real
+/// rbitcoin identity, every other field is unchanged, and the response
+/// carries the `rbitcoin_compat` object naming the profile, the claim, and
+/// the Core package dialect the profile selected. Default off reports
+/// 190000 and no compat object.
+#[test]
+fn getnetworkinfo_compat_profile_reports_claim_not_identity() {
+    let (mut ctx, dir) = ctx_empty();
+    let plain = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(plain["version"].as_u64(), Some(190_000), "{plain}");
+    assert!(plain.get("rbitcoin_compat").is_none(), "{plain}");
+
+    ctx.compat_profile = Some(RpcCompatProfile::BarkV31);
+    ctx.package_dialect = true;
+    let claimed = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(claimed["version"].as_u64(), Some(310_000), "{claimed}");
+    assert_eq!(claimed["subversion"], plain["subversion"]);
+    assert_eq!(
+        claimed["rbitcoin_compat"],
+        json!({
+            "profile": "bark-v31",
+            "claimed_version": 310_000,
+            "package_dialect": "core-is-child-with-parents",
+        })
+    );
+    for (key, val) in plain.as_object().unwrap() {
+        if key != "version" {
+            assert_eq!(&claimed[key], val, "profile must not change {key}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn trust_peer_warning_line() {
     let (mut ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
@@ -1392,6 +1428,7 @@ fn all_methods_callable_empty_or_error() {
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         blocksonly: false,
         package_dialect: false,
+        compat_profile: None,
     };
     let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(mem2["loaded"], true);
@@ -1871,6 +1908,7 @@ fn regtest_ctx(
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         blocksonly: false,
         package_dialect: false,
+        compat_profile: None,
     };
     (ctx, dir, hub)
 }
@@ -6369,6 +6407,342 @@ fn getmininginfo_names_the_tip_and_the_next_block_work() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The `--retarget-regtest` profile end to end through the accept path across
+/// three periods: the overlay initializes the first period at the difficulty
+/// floor, the first boundary retargets harder (a tight period clamps to the
+/// 60 s minimum and hardens 4x), a slow second period clamps to the 960 s
+/// maximum and eases 4x, and a slow third period would ease past the floor —
+/// `max_attainable_target` clamps it back — so the floor bits no longer
+/// satisfy a later height and the easiest the schedule ever reaches is the
+/// floor itself.
+#[test]
+fn retarget_profile_boundary_takes_over_from_the_overlay() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.apply_regtest_retarget().expect("regtest profile");
+    assert_eq!(params.difficulty_adjustment_interval(), 24);
+    let (ctx, dir, hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let initial_consensus =
+        dispatch(&ctx, "getblockchaininfo", vec![]).unwrap()["consensus"].clone();
+    let genesis = hub.tip_header().unwrap().time;
+    let floor = bitcoin::CompactTarget::from_consensus(0x1e7f_ffff);
+    let submit = |h: u32, b: bitcoin::Block, want: Option<&str>| {
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+        assert_eq!(r, json!(want), "height {h}: {r}");
+    };
+    // Tight blocks are one second apart; slow blocks 1000 s apart, so a
+    // period timespan always clamps (60 s tight, 960 s slow).
+    let mine = |h: u32, secs: u32, bits: bitcoin::CompactTarget| {
+        let prev = hub.tip_hash().unwrap();
+        rbitcoin_consensus::mine_regtest_paying_bits(
+            prev,
+            genesis + h * secs,
+            h,
+            true_spk(),
+            vec![],
+            bits,
+        )
+    };
+    // Below the interval the overlay governs: floor bits, never the pow limit.
+    submit(1, mine(1, 1, floor), None);
+    submit(2, mine(2, 1, floor), None);
+    submit(
+        3,
+        rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            genesis + 3,
+            3,
+            true_spk(),
+            vec![],
+        ),
+        Some("bad-diffbits"),
+    );
+    // The rejected block 3 never advanced the tip, so the chain resumes at 3.
+    for h in 3..=23 {
+        submit(h, mine(h, 1, floor), None);
+    }
+
+    // A tight first period clamps to the 60 s minimum: block 24 retargets
+    // 4x harder than the floor (0x1e1fffff).
+    let next = dispatch(&ctx, "getmininginfo", vec![]).unwrap()["next"].clone();
+    assert_eq!(next["height"], 24, "{next}");
+    assert_eq!(next["bits"], "1e1fffff", "{next}");
+    submit(
+        24,
+        mine(24, 1, bitcoin::CompactTarget::from_consensus(0x1e1f_ffff)),
+        None,
+    );
+
+    // Boundary + 1: no snap-back. The next block carries the boundary bits,
+    // and the floor bits (the overlay) are refused from here on.
+    let after_boundary = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(after_boundary["blocks"], 24);
+    assert_eq!(after_boundary["bits"], "1e1fffff");
+    assert_eq!(after_boundary["consensus"], initial_consensus);
+    submit(
+        25,
+        mine(25, 1, bitcoin::CompactTarget::from_consensus(0x1e1f_ffff)),
+        None,
+    );
+    submit(26, mine(26, 1, floor), Some("bad-diffbits"));
+
+    // A slow second period clamps to the 960 s maximum: block 48 eases 4x
+    // from 0x1e1fffff to 0x1e7ffffc, just under the floor.
+    for h in 26..=47 {
+        submit(
+            h,
+            mine(h, 1000, bitcoin::CompactTarget::from_consensus(0x1e1f_ffff)),
+            None,
+        );
+    }
+    let next = dispatch(&ctx, "getmininginfo", vec![]).unwrap()["next"].clone();
+    assert_eq!(next["height"], 48, "{next}");
+    assert_eq!(next["bits"], "1e7ffffc", "{next}");
+    submit(
+        48,
+        mine(
+            48,
+            1000,
+            bitcoin::CompactTarget::from_consensus(0x1e7f_fffc),
+        ),
+        None,
+    );
+
+    // A slow third period would ease 4x past the floor; the retarget clamps
+    // to the floor itself (without the clamp this boundary is 0x1f01ffff).
+    for h in 49..=71 {
+        submit(
+            h,
+            mine(h, 1000, bitcoin::CompactTarget::from_consensus(0x1e7f_fffc)),
+            None,
+        );
+    }
+    let next = dispatch(&ctx, "getmininginfo", vec![]).unwrap()["next"].clone();
+    assert_eq!(next["height"], 72, "{next}");
+    assert_eq!(next["bits"], "1e7fffff", "{next}");
+    submit(72, mine(72, 1000, floor), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `getblockchaininfo` names the effective consensus profile (schedule,
+/// floors, retarget flags, initialization, subsidy, buried activations) so a
+/// harness can fingerprint the chain it is talking to.
+#[test]
+#[allow(clippy::cognitive_complexity)] // one RPC response's complete consensus field contract
+fn getblockchaininfo_names_the_effective_consensus_profile() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.apply_regtest_retarget().expect("regtest profile");
+    let (ctx, dir, _hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    let c = &info["consensus"];
+    assert_eq!(c["network"], "regtest", "{info}");
+    assert_eq!(
+        c["consensus_profile_id"], "rbitcoin-consensus/1/regtest/retarget",
+        "{info}"
+    );
+    assert_eq!(c["initial_target_bits"], "1e7fffff", "{info}");
+    assert_eq!(c["subsidy_initial_sats"], "5000000000", "{info}");
+    let fingerprint = c["profile_fingerprint"]
+        .as_str()
+        .expect("consensus fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert_eq!(
+        c["genesis_hash"],
+        dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap(),
+        "{info}"
+    );
+    assert_eq!(c["pow_limit_bits"], "207fffff", "{info}");
+    assert_eq!(
+        c["pow_limit_target"], "7fffff0000000000000000000000000000000000000000000000000000000000",
+        "{info}"
+    );
+    assert_eq!(c["retarget_floor_bits"], "1e7fffff", "{info}");
+    assert_eq!(
+        c["retarget_floor_target"],
+        "00007fffff000000000000000000000000000000000000000000000000000000",
+        "{info}"
+    );
+    assert_eq!(c["pow_target_spacing"], 10, "{info}");
+    assert_eq!(c["pow_target_timespan"], 240, "{info}");
+    assert_eq!(c["difficulty_adjustment_interval"], 24, "{info}");
+    assert_eq!(c["no_pow_retargeting"], false, "{info}");
+    assert_eq!(c["allow_min_difficulty_blocks"], false, "{info}");
+    assert_eq!(c["enforce_bip94"], false, "{info}");
+    assert_eq!(c["regtest_pow_bits_overlay"], "1e7fffff", "{info}");
+    assert_eq!(c["subsidy_halving_interval"], 150, "{info}");
+    assert_eq!(c["coinbase_maturity"], 100, "{info}");
+    let heights = &c["activation_heights"];
+    assert_eq!(heights["bip34"], 1, "{info}");
+    assert_eq!(heights["bip66"], 1, "{info}");
+    assert_eq!(heights["bip65"], 1, "{info}");
+    assert_eq!(heights["csv"], 1, "{info}");
+    assert_eq!(heights["segwit"], 0, "{info}");
+    assert_eq!(heights["taproot"], 0, "{info}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockchaininfo_fingerprint_binds_consensus_not_rpc_runtime() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.apply_regtest_pow_bits(0x200f_ffff).unwrap();
+    let (mut ctx, _dir, _hub) = ctx_regtest_hub_on(params.clone(), 300_000_000);
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    let c = &info["consensus"];
+    let vector: Value =
+        serde_json::from_str(include_str!("../fixtures/consensus-fingerprint-v1.json")).unwrap();
+    assert_eq!(c["profile_fingerprint"], vector["sha256"]);
+    assert_eq!(c["initial_target_bits"], "200fffff");
+    assert_eq!(info["bits"], "207fffff", "initial overlay is not tip bits");
+    assert_eq!(c["subsidy_initial_sats"], "5000000000");
+
+    ctx.compat_profile = Some(RpcCompatProfile::BarkV31);
+    ctx.package_dialect = true;
+    ctx.logpath = "/different/owned/log".into();
+    ctx.start = Instant::now() - Duration::from_secs(4321);
+    ctx.connections.store(19, Ordering::Relaxed);
+    assert_eq!(
+        dispatch(&ctx, "getnetworkinfo", vec![]).unwrap()["version"],
+        310000
+    );
+    assert_eq!(
+        dispatch(&ctx, "getblockchaininfo", vec![]).unwrap()["consensus"],
+        *c
+    );
+    let (other, _other_dir, _other_hub) = ctx_regtest_hub_on(params.clone(), 100_000_000);
+    assert_eq!(
+        dispatch(&other, "getblockchaininfo", vec![]).unwrap()["consensus"],
+        *c
+    );
+
+    params.apply_regtest_pow_bits(0x2007_ffff).unwrap();
+    let (harder, _harder_dir, _harder_hub) = ctx_regtest_hub_on(params.clone(), 300_000_000);
+    let changed = dispatch(&harder, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(changed["consensus"]["initial_target_bits"], "2007ffff");
+    assert_ne!(
+        changed["consensus"]["profile_fingerprint"],
+        c["profile_fingerprint"]
+    );
+
+    params.overlay_subsidy_halving_interval(75);
+    params.apply_test_activation_height("csv", 17).unwrap();
+    let (custom, _custom_dir, _custom_hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let custom = dispatch(&custom, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(custom["consensus"]["subsidy_halving_interval"], 75);
+    assert_eq!(custom["consensus"]["subsidy_initial_sats"], "5000000000");
+    assert_eq!(custom["consensus"]["activation_heights"]["csv"], 17);
+    assert_ne!(
+        custom["consensus"]["profile_fingerprint"],
+        changed["consensus"]["profile_fingerprint"]
+    );
+}
+
+#[test]
+fn getblockchaininfo_profile_without_hub_uses_network_genesis() {
+    let (mut ctx, _dir) = ctx_empty();
+    for (network, id, bits) in [
+        (Network::Mainnet, "main", "1d00ffff"),
+        (Network::Testnet, "test", "1d00ffff"),
+        (Network::Testnet4, "testnet4", "1d00ffff"),
+        (Network::Signet, "signet", "1e0377ae"),
+    ] {
+        ctx.network = network;
+        let c = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap()["consensus"].clone();
+        assert_eq!(
+            c["consensus_profile_id"],
+            format!("rbitcoin-consensus/1/{id}/chain")
+        );
+        assert_eq!(c["initial_target_bits"], bits);
+        assert!(c["regtest_pow_bits_overlay"].is_null());
+        assert_eq!(c["subsidy_initial_sats"], "5000000000");
+    }
+    ctx.network = Network::Regtest;
+    let c = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap()["consensus"].clone();
+    assert_eq!(c["initial_target_bits"], "207fffff");
+    assert!(c["regtest_pow_bits_overlay"].is_null());
+}
+
+#[test]
+fn getblockchaininfo_fingerprint_binds_each_effective_parameter() {
+    let (mut ctx, _dir) = ctx_empty();
+    let original = rbitcoin_consensus::ChainParams::regtest();
+    let original_hash = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap()["consensus"]
+        ["profile_fingerprint"]
+        .clone();
+    let mut variants = Vec::new();
+    let mut changed = original.clone();
+    changed.overlay_subsidy_halving_interval(75);
+    variants.push(changed);
+    for name in ["bip34", "dersig", "cltv", "csv", "segwit"] {
+        let mut changed = original.clone();
+        changed.apply_test_activation_height(name, 17).unwrap();
+        variants.push(changed);
+    }
+    let mut changed = original.clone();
+    changed.apply_regtest_retarget().unwrap();
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.btc.pow_target_spacing = 300;
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.btc.pow_target_timespan = 1200;
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.btc.allow_min_difficulty_blocks = false;
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.enforce_bip94 = true;
+    variants.push(changed);
+    let mut changed = original.clone();
+    let mut exact = changed.pow_limit.to_be_bytes();
+    exact[31] = 1;
+    changed.pow_limit = bitcoin::Target::from_be_bytes(exact);
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.btc.max_attainable_target = bitcoin::Target::from_be_bytes(exact);
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.testdummy.as_mut().unwrap().threshold = 107;
+    variants.push(changed);
+    let mut changed = original.clone();
+    changed.testdummy = None;
+    variants.push(changed);
+    for (index, params) in variants.into_iter().enumerate() {
+        ctx.chain = Some(Arc::new(rbitcoin_net::ChainHub::new(
+            Query::open_or_create_tiny(_dir.join(format!("variant-{index}"))).unwrap(),
+            params,
+            rbitcoin_consensus::Milestone::NONE,
+        )));
+        let c = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_ne!(
+            c["consensus"]["profile_fingerprint"], original_hash,
+            "variant {index}"
+        );
+    }
+    ctx.network = Network::Signet;
+    let mut hashes = std::collections::HashSet::new();
+    for (script, spacing) in [(vec![0x51], 600), (vec![0x52], 600), (vec![0x51], 30)] {
+        let params =
+            rbitcoin_consensus::ChainParams::custom_signet(ScriptBuf::from_bytes(script), spacing)
+                .unwrap();
+        ctx.chain = Some(Arc::new(rbitcoin_net::ChainHub::new(
+            Query::open_or_create_tiny(_dir.join(format!("signet-{}", hashes.len()))).unwrap(),
+            params,
+            rbitcoin_consensus::Milestone::NONE,
+        )));
+        let c = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+        assert_eq!(c["consensus"]["pow_target_spacing"], spacing);
+        assert_eq!(c["consensus"]["initial_target_bits"], "1e0377ae");
+        assert!(hashes.insert(
+            c["consensus"]["profile_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        ));
+    }
+}
+
 /// Period 4 with two competing block 3s. `A3` and `B3` have different times,
 /// so block 4's work differs between the branches. `A3` is the tip.
 fn period4_fork() -> (
@@ -7425,6 +7799,7 @@ fn ctx_without_chain(src: &RpcContext) -> RpcContext {
         alert_fired: Arc::clone(&src.alert_fired),
         blocksonly: src.blocksonly,
         package_dialect: src.package_dialect,
+        compat_profile: src.compat_profile,
     }
 }
 

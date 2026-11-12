@@ -364,6 +364,50 @@ pub fn localaddresses_json(ctx: &RpcContext) -> Value {
 /// `subversion`.
 pub const RPC_COMPAT_VERSION: u64 = 190_000;
 
+/// A named RPC compatibility claim (`--rpc-compat-profile`). The node stays
+/// rbitcoin: `subversion` keeps the real software identity and consensus,
+/// P2P, and the default RPC outputs are untouched. The profile only changes
+/// what `getnetworkinfo` reports to version-gated clients and selects the
+/// package dialect those clients submit. Regtest only (the node config
+/// rejects other networks before the store opens).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcCompatProfile {
+    /// Reports `getnetworkinfo.version = 310000` (the bark `c419159`
+    /// server floor) and the Core `IsChildWithParents` package dialect.
+    BarkV31,
+}
+
+impl RpcCompatProfile {
+    /// The one `--rpc-compat-profile` / conf `rpc_compat_profile` value
+    /// that names this profile.
+    pub fn name(self) -> &'static str {
+        "bark-v31"
+    }
+
+    /// The `getnetworkinfo.version` this profile claims.
+    pub fn claimed_version(self) -> u64 {
+        310_000
+    }
+
+    /// The `submitpackage` package dialect this profile selects; also the
+    /// `rbitcoin_compat.package_dialect` value.
+    pub fn package_dialect(self) -> &'static str {
+        "core-is-child-with-parents"
+    }
+
+    /// Parse the one accepted profile name. There is no free-form version
+    /// knob: any other value is an error naming the accepted value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value == "bark-v31" {
+            Ok(Self::BarkV31)
+        } else {
+            Err(format!(
+                "unknown rpc-compat-profile {value:?}: expected bark-v31"
+            ))
+        }
+    }
+}
+
 fn networks_json(ctx: &RpcContext) -> Value {
     let nets = rbitcoin_net::OnlyNet::ALL;
     let reach = match ctx.addrman.as_ref() {
@@ -402,8 +446,10 @@ pub fn getnetworkinfo(ctx: &RpcContext) -> Value {
     let flags =
         rbitcoin_net::local_service_flags(ctx.query.prune_seqsigwit(), ctx.peers.as_deref());
     let svc_bits = flags.to_u64();
-    json!({
-        "version": RPC_COMPAT_VERSION,
+    let mut info = json!({
+        "version": ctx
+            .compat_profile
+            .map_or(RPC_COMPAT_VERSION, RpcCompatProfile::claimed_version),
         "subversion": ctx.subversion,
         "protocolversion": 70016,
         "localservices": format!("{svc_bits:016x}"),
@@ -419,5 +465,13 @@ pub fn getnetworkinfo(ctx: &RpcContext) -> Value {
         "incrementalfee": relay_fee_json(),
         "localaddresses": localaddresses_json(ctx),
         "warnings": rpc_warnings(ctx),
-    })
+    });
+    if let Some(profile) = ctx.compat_profile {
+        info["rbitcoin_compat"] = json!({
+            "profile": profile.name(),
+            "claimed_version": profile.claimed_version(),
+            "package_dialect": profile.package_dialect(),
+        });
+    }
+    info
 }

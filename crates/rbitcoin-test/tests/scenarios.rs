@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
 use rbitcoin_consensus::{genesis_block, ChainParams, Milestone};
-use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig, NodeEnv};
+use rbitcoin_node::{cli_main as node_cli_main, run_node, run_p2p, NodeConfig, NodeEnv, P2pListen};
 use rbitcoin_primitives::{Fk, Height, Network, VERSION};
 use rbitcoin_query::accept_and_connect_block;
 use rbitcoin_query::testutil::FixtureChain;
@@ -3605,4 +3605,119 @@ fn wire_prep_parent_layout_and_load_ahead() {
     (tip, tip_time) =
         pin_wire_prep_already_archived(&q, &params, ms, tip, tip_time, cb2, maturity + 3);
     pin_wire_prep_cold_class_a_denserels(&q, &params, ms, tip, tip_time, cb3, maturity + 5);
+}
+
+/// One JSON-RPC call over TCP: connect failure and a JSON-RPC error object
+/// both panic (the journey owns the node it is talking to).
+async fn rpc_call(
+    rpc: std::net::SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let v = rbitcoin_test::jsonrpc::try_jsonrpc(rpc, method, params)
+        .await
+        .unwrap_or_else(|e| panic!("rpc {method} connect: {e}"));
+    assert!(v["error"].is_null(), "rpc {method}: {v}");
+    v["result"].clone()
+}
+
+/// `--retarget-regtest` on a real node over TCP RPC: `getblockchaininfo`
+/// fingerprints the effective consensus profile, `generatetoaddress` mines
+/// the first period at the floor, the boundary at height 24 takes over from
+/// the overlay, and the block after the boundary keeps the boundary bits
+/// (no snap-back to the overlay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retarget_regtest_node_journey() {
+    const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    // Regtest genesis time (2011): mocking the clock just past it keeps the
+    // first period tight, so the boundary clamps to the 60 s minimum.
+    const GENESIS_TIME: u64 = 1_296_688_602;
+
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path().join("retarget-node");
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("rpc.token");
+    std::fs::write(&token, "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut cfg = NodeConfig::default()
+        .with_datadir(&dir)
+        .with_network(Network::Regtest)
+        .with_tiny_heads();
+    cfg.retarget_regtest = true;
+    cfg.listen.p2p = P2pListen::Off;
+    cfg.listen.p2p_explicit = true;
+    cfg.listen.use_seeds = false;
+    cfg.listen.discover = false;
+    cfg.listen.max_inbound = 0;
+    cfg.rpc.listen = Some("127.0.0.1:0".parse().expect("rpc listen"));
+    // Mocked 2011 timestamps must not latch the tip as stale.
+    cfg.max_tip_age_secs = Some(u64::MAX);
+    let mut join = tokio::task::spawn_blocking(move || {
+        let _block = rbitcoin_net::BlockingRegion::enter();
+        tokio::runtime::Handle::current().block_on(run_p2p(cfg))
+    });
+    let rpc = tokio::select! {
+        biased;
+        addr = rbitcoin_node::run::wait_published_listener(&dir, "rpc", std::time::Duration::from_secs(40)) => addr,
+        result = &mut join => match result {
+            Ok(Ok(())) => panic!("rpc exited before publishing rpc.addr"),
+            Ok(Err(e)) => panic!("rpc exited before publishing rpc.addr: {e}"),
+            Err(e) => panic!("rpc task ended before publishing rpc.addr: {e}"),
+        },
+    };
+
+    // The effective profile is fingerprintable from the wire.
+    let info = rpc_call(rpc, "getblockchaininfo", serde_json::json!([])).await;
+    let c = &info["consensus"];
+    assert_eq!(c["network"], "regtest", "{info}");
+    assert_eq!(c["no_pow_retargeting"], false, "{info}");
+    assert_eq!(c["allow_min_difficulty_blocks"], false, "{info}");
+    assert_eq!(c["enforce_bip94"], false, "{info}");
+    assert_eq!(c["pow_target_spacing"], 10, "{info}");
+    assert_eq!(c["pow_target_timespan"], 240, "{info}");
+    assert_eq!(c["difficulty_adjustment_interval"], 24, "{info}");
+    assert_eq!(c["retarget_floor_bits"], "1e7fffff", "{info}");
+    assert_eq!(c["regtest_pow_bits_overlay"], "1e7fffff", "{info}");
+    assert_eq!(c["subsidy_halving_interval"], 150, "{info}");
+    assert_eq!(c["coinbase_maturity"], 100, "{info}");
+    let g0 = rpc_call(rpc, "getblockhash", serde_json::json!([0])).await;
+    assert_eq!(c["genesis_hash"], g0, "{info}");
+
+    // First period: 23 blocks at the floor.
+    rpc_call(rpc, "setmocktime", serde_json::json!([GENESIS_TIME + 30])).await;
+    let mined = rpc_call(rpc, "generatetoaddress", serde_json::json!([23, ADDR])).await;
+    assert_eq!(mined.as_array().map(Vec::len), Some(23), "{mined}");
+
+    // A tight first period clamps to the 60 s minimum: the boundary at
+    // height 24 retargets 4x harder than the floor.
+    let next = rpc_call(rpc, "getmininginfo", serde_json::json!([])).await;
+    assert_eq!(next["next"]["height"], 24, "{next}");
+    assert_eq!(next["next"]["bits"], "1e1fffff", "{next}");
+
+    // The boundary block carries the retargeted bits ...
+    rpc_call(rpc, "generatetoaddress", serde_json::json!([1, ADDR])).await;
+    let b24 = rpc_call(rpc, "getblockhash", serde_json::json!([24])).await;
+    let hdr24 = rpc_call(rpc, "getblockheader", serde_json::json!([b24])).await;
+    assert_eq!(hdr24["bits"], "1e1fffff", "{hdr24}");
+
+    // ... and the block after it keeps them: no snap-back to the overlay.
+    rpc_call(rpc, "generatetoaddress", serde_json::json!([1, ADDR])).await;
+    let b25 = rpc_call(rpc, "getblockhash", serde_json::json!([25])).await;
+    let hdr25 = rpc_call(rpc, "getblockheader", serde_json::json!([b25])).await;
+    assert_eq!(hdr25["bits"], "1e1fffff", "{hdr25}");
+    let after = rpc_call(rpc, "getmininginfo", serde_json::json!([])).await;
+    assert_eq!(after["next"]["height"], 26, "{after}");
+    assert_eq!(after["next"]["bits"], "1e1fffff", "{after}");
+
+    let _ = rbitcoin_test::jsonrpc::try_jsonrpc(rpc, "stop", serde_json::json!([])).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), join).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("retarget node run_p2p: {e}"),
+        Ok(Err(e)) => panic!("retarget node run_p2p join: {e}"),
+        Err(_) => panic!("retarget node did not stop"),
+    }
 }

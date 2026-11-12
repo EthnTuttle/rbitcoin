@@ -127,6 +127,8 @@ pub struct RpcConfig {
     pub blocksonly: bool,
     /// See [`crate::methods::RpcContext::package_dialect`].
     pub package_dialect: bool,
+    /// See [`crate::methods::RpcContext::compat_profile`].
+    pub compat_profile: Option<crate::methods::RpcCompatProfile>,
 }
 
 /// Live RPC server handle.
@@ -231,6 +233,7 @@ pub async fn run_rpc(
         alert_fired: Arc::new(AtomicBool::new(false)),
         blocksonly: config.blocksonly,
         package_dialect: config.package_dialect,
+        compat_profile: config.compat_profile,
     });
 
     let n = work_queue_permits(config.work_queue);

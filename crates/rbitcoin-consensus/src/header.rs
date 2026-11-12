@@ -298,9 +298,16 @@ pub fn min_diff_gap(params: &ChainParams, prev_time: u32, header_time: u32) -> b
 
 /// With the regtest difficulty overlay set, `bits` equal to the `pow_limit`
 /// bits become the overlay unless Core would still require those bits. That is
-/// the min-difficulty time gap, or a retarget boundary: regtest does not
-/// retarget, so the parent bits stand, including the pow limit. Ignored unless
-/// `params` is regtest. Every next-work path must end here.
+/// the min-difficulty time gap, or a retarget boundary. With retargeting on
+/// (`--retarget-regtest`) the overlay only initializes the first period: the
+/// floor caps every later retarget below the pow limit, so on a chain the
+/// profile validated the computed bits are never the pow-limit bits again.
+/// Pow-limit bits past the first block can only come from a datadir mined
+/// under default regtest; the overlay steps such a chain onto the profile at
+/// the next non-boundary height, which is why `--retarget-regtest` wants a
+/// fresh datadir (`docs/operator/operations.md`). Without retargeting the
+/// overlay is the fixed difficulty of every block at height >= 1. Ignored
+/// unless `params` is regtest. Every next-work path must end here.
 #[doc(hidden)]
 pub fn apply_regtest_pow_overlay(
     params: &ChainParams,

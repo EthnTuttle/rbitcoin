@@ -7,6 +7,8 @@ use rbitcoin_primitives::{median_time_past_times, Fk, Height, MedianWindow};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
+mod consensus_profile;
+
 #[doc(hidden)]
 pub fn wait_chain_tip(ctx: &RpcContext) {
     if let Some(c) = ctx.chain.as_ref() {
@@ -114,6 +116,7 @@ pub fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
             info["target"] = json!(target_hex(rec.bits));
         }
     }
+    info["consensus"] = consensus_info(ctx);
     Ok(info)
 }
 
@@ -191,6 +194,57 @@ pub fn difficulty_from_bits(bits: u32) -> f64 {
 pub fn target_hex(bits: u32) -> String {
     let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
     format!("{target:064x}")
+}
+
+/// The effective consensus profile behind this node: schedule, floors,
+/// retarget flags, first-period initialization, subsidy, and buried
+/// activation heights. `--regtest-pow-bits` and `--retarget-regtest` only
+/// reshape regtest; this object is how a harness fingerprints the chain it
+/// is talking to. Not a Bitcoin Core field.
+pub fn consensus_info(ctx: &RpcContext) -> Value {
+    let cp = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.params.clone())
+        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network));
+    let pow_limit_bits = cp.pow_limit.to_compact_lossy().to_consensus();
+    let floor_bits = cp
+        .btc
+        .max_attainable_target
+        .to_compact_lossy()
+        .to_consensus();
+    let profile = consensus_profile::EffectiveProfile::new(&cp);
+    json!({
+        "network": chain_name(ctx.network),
+        "consensus_profile_id": profile.id,
+        "profile_fingerprint": profile.fingerprint,
+        "initial_target_bits": format!("{:08x}", profile.initial_target_bits),
+        "subsidy_initial_sats": profile.subsidy_initial_sats.to_string(),
+        "genesis_hash": hash_hex_display(cp.genesis_hash.as_byte_array()),
+        "pow_limit_bits": format!("{:08x}", pow_limit_bits),
+        "pow_limit_target": target_hex(pow_limit_bits),
+        "retarget_floor_bits": format!("{:08x}", floor_bits),
+        "retarget_floor_target": target_hex(floor_bits),
+        "pow_target_spacing": cp.btc.pow_target_spacing,
+        "pow_target_timespan": cp.btc.pow_target_timespan,
+        "difficulty_adjustment_interval": cp.difficulty_adjustment_interval(),
+        "no_pow_retargeting": cp.no_pow_retargeting(),
+        "allow_min_difficulty_blocks": cp.allow_min_difficulty_blocks(),
+        "enforce_bip94": cp.enforce_bip94,
+        "regtest_pow_bits_overlay": cp
+            .regtest_pow_bits_overlay
+            .map(|b| format!("{:08x}", b.to_consensus())),
+        "subsidy_halving_interval": cp.subsidy_halving_interval(),
+        "coinbase_maturity": cp.coinbase_maturity(),
+        "activation_heights": {
+            "bip34": cp.btc.bip34_height,
+            "bip66": cp.btc.bip66_height,
+            "bip65": cp.btc.bip65_height,
+            "csv": cp.csv_height(),
+            "segwit": cp.segwit_height(),
+            "taproot": cp.taproot_height(),
+        },
+    })
 }
 
 /// Core `UniValue` `setprecision(16)` defaultfloat. Keeps the 16th significant
@@ -682,7 +736,7 @@ pub fn held_header_value(ctx: &RpcContext, block: &Block, verbose: bool) -> Resu
     }))
 }
 
-/// 32-byte BE chainwork hex (regtest = 2 per block). Empty store → 64 zeros.
+/// 32-byte BE chainwork hex (default regtest = 2 per block). Empty store → 64 zeros.
 pub fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String {
     let Some(tip) = through.or_else(|| ctx.query.tip_height()) else {
         return "00".repeat(32);

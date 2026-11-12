@@ -198,8 +198,11 @@ pub fn finish_operator_config(
         config.bq_assign_stop_bytes = stop;
     }
     config.sh_force_rebuild |= env.sh_force_rebuild;
-    config.rpc.package_dialect |= env.rpc_package_dialect;
     config.rpc.wait_tip_idle |= env.rpc_wait_tip_idle;
+    if let Err(e) = config.resolve_rpc_env(env) {
+        eprintln!("error: {e}");
+        return Err(ExitCode::from(2));
+    }
     config.resolve_listen_defaults();
     if let Err(e) = config.seal_trust_peer() {
         eprintln!("error: {e}");
@@ -344,11 +347,11 @@ pub fn operator_usage() -> String {
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] [--sv2-tp-idle-timeout SECS] [--sv2-tp-fee-delta SATS] [--sv2-tp-template-interval SECS] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--esplora-max-inflight N] [--esplora-block-template] \\\n\
-    [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-cookie-perms owner|group|all] [--rpc-work-queue N] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-cookie-perms owner|group|all] [--rpc-work-queue N] [--rpc-compat-profile bark-v31] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
-    [--test-activation-height name@HEIGHT] [--regtest-pow-bits BITS] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
+    [--test-activation-height name@HEIGHT] [--regtest-pow-bits BITS] [--retarget-regtest[=0|1]] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
     [--net-permission SPEC] [--net-permission-bind SPEC] [--net-permission-relay[=0|1]] [--net-permission-force-relay[=0|1]] \\\n\
     [--blocks-only] [--prefill-compact[=0|1]] [--min-relay-tx-fee BTC] \\\n\
     [--limit-cluster-count N] [--limit-cluster-size KVB] [--peer-timeout SECS] \\\n\
@@ -369,6 +372,15 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
   signet 0, testnet4 0 (testnet4 still ships Core's min chain work), regtest 0.\n\
   Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
+Regtest PoW: --retarget-regtest turns retargeting on with a fixed lab schedule:\n\
+  10 s target spacing, 240 s target timespan (24-block interval), no min-difficulty\n\
+  gaps, BIP94 off, and a 0x1e7fffff difficulty floor that also seeds the first\n\
+  period. --regtest-pow-bits then overrides that seed and must be at least as hard\n\
+  as the floor: the regtest pow limit sits just under 2^256, so a retarget computed\n\
+  from it overflows the 256-bit multiply (debug builds assert, release wraps; see\n\
+  operations.md). Wants a fresh datadir; a datadir mined under default regtest is\n\
+  outside the profile's contract.\n\
+  getblockchaininfo `consensus` names the effective profile. Not a Bitcoin Core option.\n\
 Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 200; half for tx-relaying peers).\n\
 Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the same grammar as --connect.\n\
@@ -418,7 +430,7 @@ SV2: --sv2-tp-listen ADDR serves the Stratum v2 Template Distribution Protocol (
     at most 86400 (default 0: never; SRI pools and JDCs stay silent between shares).\n\
   --sv2-tp-fee-delta SATS pushes a same-tip template once its fees gain SATS over the last one sent (default 1000).\n\
   --sv2-tp-template-interval SECS checks for that gain every SECS, 1 to 86400 (default 5).\n\
-RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer), created mode 0600; an existing token must be owner-only on Unix. Delete a wider file and start again so the node mints a new token (Windows has no mode bits). --rpc-cookie-file opts TCP into Core cookie HTTP Basic. --rpc-cookie-perms owner|group|all (default owner) is the widest Unix mode that file may have (owner 0600, group 0640, all 0644); the node never creates or chmods it. Windows has no mode bits. No --rpcuser. --rest turns on unauthenticated /rest/ on those listeners (off unless set).\n\
+RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer), created mode 0600; an existing token must be owner-only on Unix. Delete a wider file and start again so the node mints a new token (Windows has no mode bits). --rpc-cookie-file opts TCP into Core cookie HTTP Basic. --rpc-cookie-perms owner|group|all (default owner) is the widest Unix mode that file may have (owner 0600, group 0640, all 0644); the node never creates or chmods it. Windows has no mode bits. No --rpcuser. --rest turns on unauthenticated /rest/ on those listeners (off unless set). --rpc-compat-profile bark-v31 (regtest only) reports getnetworkinfo.version 310000 and appends an rbitcoin_compat object while subversion keeps the real rbitcoin identity; it also selects the Core IsChildWithParents submitpackage dialect (RBITCOIN_RPC_PACKAGE_DIALECT=0 with it is a config error).\n\
 Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
   (seqsigwit, txstat, input, and blockfilter / sp_tweaks once enabled).\n\
   Default (flag omitted): those files live under --datadir. --prune-seqsigwit\n\
@@ -471,6 +483,7 @@ pub fn is_bool_key(key: &str) -> bool {
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"
+            | "retarget_regtest"
             | "net_permission_relay"
             | "net_permission_force_relay"
             | "no_seeds"
